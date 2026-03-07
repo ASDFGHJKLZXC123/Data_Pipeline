@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crypto Pipeline Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="container">
+    <section class="panel">
+      <h1>Crypto Pipeline Dashboard</h1>
+      <p class="muted">Trigger ingestion and query the warehouse from a single interface.</p>
+      <div class="controls">
+        <button id="runIngestionBtn">Run Ingestion Now</button>
+        <button id="refreshBtn">Refresh Snapshot</button>
+        <label>
+          Top N
+          <input id="topNInput" type="number" value="50" min="1" max="250">
+        </label>
+      </div>
+      <pre id="runResult" class="result">No ingestion run in this session.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Latest Market Snapshot</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Price (USD)</th>
+              <th>Market Cap</th>
+              <th>24h Volume</th>
+              <th>24h Change %</th>
+              <th>Timestamp</th>
+            </tr>
+          </thead>
+          <tbody id="snapshotTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Price Series</h2>
+      <div class="controls">
+        <label>
+          Symbol
+          <select id="symbolSelect">
+            {% for symbol in symbols %}
+            <option value="{{ symbol }}">{{ symbol }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Points
+          <input id="pointsInput" type="number" value="240" min="10" max="2000">
+        </label>
+        <button id="loadSeriesBtn">Load Series</button>
+      </div>
+      <canvas id="seriesChart" width="900" height="280"></canvas>
+      <p id="seriesMeta" class="muted"></p>
+    </section>
+  </main>
+
+  <script>
+    const initialSnapshot = {{ initial_snapshot | tojson }};
+
+    const snapshotBody = document.getElementById('snapshotTableBody');
+    const runResult = document.getElementById('runResult');
+    const topNInput = document.getElementById('topNInput');
+    const symbolSelect = document.getElementById('symbolSelect');
+    const pointsInput = document.getElementById('pointsInput');
+    const seriesCanvas = document.getElementById('seriesChart');
+    const seriesMeta = document.getElementById('seriesMeta');
+
+    const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+    const compactUsd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', notation: 'compact', maximumFractionDigits: 2 });
+
+    function renderSnapshot(rows) {
+      snapshotBody.innerHTML = '';
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.market_cap_rank ?? ''}</td>
+          <td>${row.symbol ?? ''}</td>
+          <td>${row.name ?? ''}</td>
+          <td>${row.price_usd != null ? usd.format(row.price_usd) : ''}</td>
+          <td>${row.market_cap_usd != null ? compactUsd.format(row.market_cap_usd) : ''}</td>
+          <td>${row.volume_24h_usd != null ? compactUsd.format(row.volume_24h_usd) : ''}</td>
+          <td>${row.price_change_24h_pct != null ? row.price_change_24h_pct.toFixed(2) + '%' : ''}</td>
+          <td>${row.snapshot_ts ?? ''}</td>
+        `;
+        snapshotBody.appendChild(tr);
+      }
+    }
+
+    function drawSeries(rows) {
+      const ctx = seriesCanvas.getContext('2d');
+      ctx.clearRect(0, 0, seriesCanvas.width, seriesCanvas.height);
+
+      if (!rows.length) {
+        ctx.fillStyle = '#6b7280';
+        ctx.font = '14px sans-serif';
+        ctx.fillText('No series data found for this symbol.', 16, 24);
+        seriesMeta.textContent = '';
+        return;
+      }
+
+      const prices = rows.map(r => r.price_usd).filter(v => typeof v === 'number');
+      const min = Math.min(...prices);
+      const max = Math.max(...prices);
+      const left = 40;
+      const top = 20;
+      const w = seriesCanvas.width - 60;
+      const h = seriesCanvas.height - 40;
+
+      ctx.strokeStyle = '#d1d5db';
+      ctx.strokeRect(left, top, w, h);
+
+      ctx.beginPath();
+      ctx.strokeStyle = '#2563eb';
+      ctx.lineWidth = 2;
+
+      rows.forEach((row, i) => {
+        const x = left + (i / Math.max(rows.length - 1, 1)) * w;
+        const normalized = (row.price_usd - min) / Math.max(max - min, 1e-8);
+        const y = top + h - normalized * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      const first = rows[0];
+      const last = rows[rows.length - 1];
+      seriesMeta.textContent = `${last.symbol || ''}: ${rows.length} points | ${usd.format(min)} to ${usd.format(max)} | ${first.price_ts} -> ${last.price_ts}`;
+    }
+
+    async function refreshSnapshot() {
+      const limit = Number(topNInput.value) || 50;
+      const res = await fetch(`/api/latest?limit=${limit}`);
+      const payload = await res.json();
+      renderSnapshot(payload.rows || []);
+    }
+
+    async function runIngestion() {
+      runResult.textContent = 'Running ingestion...';
+      const topN = Number(topNInput.value) || 50;
+      const res = await fetch(`/api/run-once?top_n=${topN}`, { method: 'POST' });
+      const payload = await res.json();
+      runResult.textContent = JSON.stringify(payload, null, 2);
+      await refreshSnapshot();
+    }
+
+    async function loadSeries() {
+      const symbol = symbolSelect.value;
+      const points = Number(pointsInput.value) || 240;
+      const res = await fetch(`/api/series/${encodeURIComponent(symbol)}?points=${points}`);
+      const payload = await res.json();
+      drawSeries(payload.rows || []);
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', refreshSnapshot);
+    document.getElementById('runIngestionBtn').addEventListener('click', runIngestion);
+    document.getElementById('loadSeriesBtn').addEventListener('click', loadSeries);
+
+    renderSnapshot(initialSnapshot);
+    if (symbolSelect.value) {
+      loadSeries();
+    }
+  </script>
+</body>
+</html>
